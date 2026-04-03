@@ -4,12 +4,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import datetime
+import uvicorn
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- 1. SETTING CORS (Pintu Masuk dari Hosting Frontend) ---
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 
 DB_FILE = "sweetescape.db"
 
+# --- 2. DATABASE UTILITY ---
 def dict_factory(cursor, row):
     d = {}
     for idx, col in enumerate(cursor.description): d[col[0]] = row[idx]
@@ -20,30 +29,41 @@ def get_db():
     conn.row_factory = dict_factory
     return conn
 
+# --- 3. INISIALISASI DATABASE ---
 def init_db():
     conn = get_db(); c = conn.cursor()
+    # Tabel User & Admin
     c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, status TEXT, role TEXT)''')
+    # Tabel Produk
     c.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price INTEGER, stock INTEGER, category TEXT, image TEXT)''')
+    # Tabel Pesanan
     c.execute('''CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT, whatsapp TEXT, payment_method TEXT, proof_of_payment TEXT, details TEXT, total INTEGER, date TEXT, time TEXT, status TEXT DEFAULT 'Pending', shipping_type TEXT)''')
+    # Tabel Pengaturan (QRIS, Bank, dll)
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    # Tabel Log Stok
     c.execute('''CREATE TABLE IF NOT EXISTS stock_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, product_name TEXT, type TEXT, qty INTEGER, date TEXT, time TEXT)''')
     
+    # Cek Kolom Baru (Migrasi Ringan)
     try: c.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'Pending'")
     except: pass
     try: c.execute("ALTER TABLE orders ADD COLUMN shipping_type TEXT")
     except: pass
 
+    # Buat User Admin Default jika belum ada
     c.execute("SELECT * FROM users WHERE username='admin'")
     if not c.fetchone(): 
         c.execute("INSERT INTO users (username, password, status, role) VALUES ('admin', '123', 'approved', 'owner')")
     
+    # Inisialisasi Settings Default
     for key in ['qris_image', 'bank_info', 'webhook_url']:
         c.execute("SELECT * FROM settings WHERE key=?", (key,))
         if not c.fetchone(): c.execute("INSERT INTO settings (key, value) VALUES (?, '')", (key,))
+        
     conn.commit(); conn.close()
 
 init_db()
 
+# --- 4. MODEL DATA (PYDANTIC) ---
 class UserAuth(BaseModel): username: str; password: str
 class ProductCreate(BaseModel): name: str; price: int; stock: int; category: str; image: str
 class OrderItem(BaseModel): product_id: int; quantity: int
@@ -51,21 +71,24 @@ class OrderCreate(BaseModel): customer_name: str; whatsapp: str; payment_method:
 class OrderStatusUpdate(BaseModel): status: str
 class PaymentUpdate(BaseModel): qris: str; bank: str; webhook: str
 
-# --- AUTH ---
+# --- 5. ENDPOINT AUTH ---
 @app.post("/register")
 def register(user: UserAuth):
-    conn = get_db(); c = conn.cursor()
-    c.execute("INSERT INTO users (username, password, status, role) VALUES (?, ?, 'pending', 'admin')", (user.username, user.password))
-    conn.commit(); conn.close(); return {"msg": "ok"}
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("INSERT INTO users (username, password, status, role) VALUES (?, ?, 'pending', 'admin')", (user.username, user.password))
+        conn.commit(); conn.close(); return {"msg": "ok"}
+    except:
+        raise HTTPException(status_code=400, detail="Username sudah digunakan")
 
 @app.post("/login")
 def login(user: UserAuth):
     conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM users WHERE username=? AND password=?", (user.username, user.password))
     u = c.fetchone(); conn.close()
     if u:
-        if u['status'] == 'pending': raise HTTPException(status_code=403, detail="Menunggu ACC")
+        if u['status'] == 'pending': raise HTTPException(status_code=403, detail="Menunggu ACC Owner")
         return {"token": f"tk-{user.username}", "role": u['role']}
-    raise HTTPException(status_code=401)
+    raise HTTPException(status_code=401, detail="User tidak ditemukan")
 
 @app.get("/users")
 def get_users():
@@ -79,7 +102,7 @@ def approve_user(username: str):
 def delete_user(username: str):
     conn = get_db(); c = conn.cursor(); c.execute("DELETE FROM users WHERE username=?", (username,)); conn.commit(); conn.close(); return {"msg": "ok"}
 
-# --- PRODUCTS (Lengkap dengan Add & Edit Individual) ---
+# --- 6. ENDPOINT PRODUK ---
 @app.get("/products")
 def get_products():
     conn = get_db(); c = conn.cursor(); c.execute("SELECT * FROM products"); p = c.fetchall(); conn.close(); return p
@@ -107,7 +130,7 @@ def bulk_add_products(products: List[ProductCreate]):
         c.execute("INSERT INTO products (name, price, stock, category, image) VALUES (?, ?, ?, ?, ?)", (p.name, p.price, p.stock, p.category, p.image))
     conn.commit(); conn.close(); return {"msg": "ok"}
 
-# --- ORDERS ---
+# --- 7. ENDPOINT PESANAN (LOGIKA PENGURANGAN STOK) ---
 @app.post("/orders")
 def create_order(o: OrderCreate):
     conn = get_db(); c = conn.cursor(); dt = datetime.datetime.now().strftime("%Y-%m-%d"); tm = datetime.datetime.now().strftime("%H:%M")
@@ -117,14 +140,18 @@ def create_order(o: OrderCreate):
             c.execute("SELECT name, stock FROM products WHERE id=?", (i.product_id,))
             prod = c.fetchone()
             if prod and prod['stock'] >= i.quantity:
+                # Kurangi stok produk secara otomatis
                 c.execute("UPDATE products SET stock=? WHERE id=?", (prod['stock'] - i.quantity, i.product_id))
                 items_detail.append(f"{prod['name']} ({i.quantity}x)")
-            else: raise Exception("Stok Habis")
+            else: raise Exception(f"Stok {prod['name'] if prod else 'Produk'} Habis!")
+        
         full_details = f"{o.details} | " + ", ".join(items_detail)
         c.execute("INSERT INTO orders (customer_name, whatsapp, payment_method, proof_of_payment, details, total, date, time, status, shipping_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)", 
                   (o.customer_name, o.whatsapp, o.payment_method, o.proof_of_payment, full_details, o.total, dt, tm, o.shipping_type))
+        
         new_id = c.lastrowid; conn.commit(); return {"order_id": new_id}
-    except Exception as e: conn.rollback(); raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e: 
+        conn.rollback(); raise HTTPException(status_code=400, detail=str(e))
     finally: conn.close()
 
 @app.get("/orders")
@@ -140,11 +167,12 @@ def get_order_status(order_id: int):
     conn = get_db(); c = conn.cursor(); c.execute("SELECT status, shipping_type FROM orders WHERE id=?", (order_id,))
     o = c.fetchone(); conn.close(); return o
 
-# --- SETTINGS & REPORT ---
+# --- 8. SETTINGS & REPORT ---
 @app.get("/settings/payment")
 def get_pay_settings():
     conn = get_db(); c = conn.cursor(); c.execute("SELECT key, value FROM settings"); rows = c.fetchall(); conn.close()
-    res = {r['key']: r['value'] for r in rows}; return {"qris": res.get('qris_image'), "bank": res.get('bank_info'), "webhook": res.get('webhook_url')}
+    res = {r['key']: r['value'] for r in rows}
+    return {"qris": res.get('qris_image'), "bank": res.get('bank_info'), "webhook": res.get('webhook_url')}
 
 @app.post("/settings/payment")
 def update_pay_settings(p: PaymentUpdate):
@@ -161,3 +189,6 @@ def get_report(date: str):
     s = c.fetchone()
     c.execute("SELECT * FROM orders WHERE date=?", (date,)); ords = c.fetchall()
     conn.close(); return {"omzet": s['omzet'] or 0, "total_order": s['count'] or 0, "orders": ords}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=10000)
